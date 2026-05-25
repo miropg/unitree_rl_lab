@@ -21,7 +21,18 @@ def format_value(x):
         return x
 
 
-def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
+def _write_deploy_yaml(cfg: dict, log_dir: str):
+    filename = os.path.join(log_dir, "params", "deploy.yaml")
+    if not os.path.exists(os.path.dirname(filename)):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    if not isinstance(cfg, dict):
+        cfg = class_to_dict(cfg)
+    cfg = format_value(cfg)
+    with open(filename, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=None, sort_keys=False)
+
+
+def _collect_common_cfg(env):
     asset: Articulation = env.scene["robot"]
     joint_sdk_names = env.cfg.scene.robot.joint_sdk_names
     joint_ids_map, _ = resolve_matching_names(asset.data.joint_names, joint_sdk_names, preserve_order=True)
@@ -36,8 +47,10 @@ def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
     damping[joint_ids_map] = wp.to_torch(asset.data.default_joint_damping)[0].detach().cpu().numpy().tolist()
     cfg["damping"] = damping.tolist()
     cfg["default_joint_pos"] = wp.to_torch(asset.data.default_joint_pos)[0].detach().cpu().numpy().tolist()
+    return cfg, asset
 
-    # --- commands ---
+
+def _collect_command_cfg(env, cfg: dict):
     cfg["commands"] = {}
     if hasattr(env.cfg.commands, "base_velocity"):  # some environments do not have base_velocity command
         cfg["commands"]["base_velocity"] = {}
@@ -48,6 +61,71 @@ def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
         for item_name in ["lin_vel_x", "lin_vel_y", "ang_vel_z"]:
             ranges[item_name] = list(ranges[item_name])
         cfg["commands"]["base_velocity"]["ranges"] = ranges
+
+
+def _scale_to_list(scale, obs_dim: int):
+    if scale is None:
+        return [1.0 for _ in range(obs_dim)]
+    scale = scale.detach().cpu().numpy().tolist()
+    if isinstance(scale, float):
+        return [scale for _ in range(obs_dim)]
+    return scale
+
+
+def _export_deploy_cfg_direct(env, log_dir):
+    cfg, _asset = _collect_common_cfg(env)
+    _collect_command_cfg(env, cfg)
+
+    # --- actions ---
+    action_dim = int(env.cfg.action_space)
+    cfg["actions"] = {
+        "JointPositionAction": {
+            "clip": list(env.cfg.action_clip) if env.cfg.action_clip is not None else None,
+            "joint_names": [".*"],
+            "scale": [float(env.cfg.action_scale) for _ in range(action_dim)],
+            "offset": env._default_joint_pos[0].detach().cpu().numpy().tolist(),
+            "joint_ids": None,
+        }
+    }
+
+    # --- observations ---
+    cfg["observations"] = {}
+    for obs_name, func, params, scale, _noise_cfg, _modifier_cfgs, obs_cfg in env._policy_obs_terms:
+        obs_dims = tuple(func(env, **params).shape)
+        term_cfg = obs_cfg.copy()
+        term_cfg.scale = _scale_to_list(scale, obs_dims[1])
+        if term_cfg.clip is not None:
+            term_cfg.clip = list(term_cfg.clip)
+        if not term_cfg.history_length:
+            term_cfg.history_length = 1
+
+        term_cfg = term_cfg.to_dict()
+        for key in ["func", "modifiers", "noise", "flatten_history_dim"]:
+            del term_cfg[key]
+        cfg["observations"][obs_name] = term_cfg
+
+    _write_deploy_yaml(cfg, log_dir)
+
+
+def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
+    # ``export_deploy_cfg`` introspects ActionManager / ObservationManager
+    # to dump a sim2real-ready yaml.  Direct-workflow envs keep equivalent
+    # metadata in their own cached observation/action tables instead of full
+    # Manager internals, so they use a separate dumper below.
+    if not isinstance(env, ManagerBasedRLEnv):
+        if all(hasattr(env, attr) for attr in ("_policy_obs_terms", "_default_joint_pos")):
+            _export_deploy_cfg_direct(env, log_dir)
+            return
+        print(
+            "[INFO] export_deploy_cfg: skipping - not a ManagerBasedRLEnv "
+            f"(got {type(env).__name__}); deploy.yaml will not be created."
+        )
+        return
+
+    cfg, asset = _collect_common_cfg(env)
+
+    # --- commands ---
+    _collect_command_cfg(env, cfg)
 
     # --- actions ---
     action_names = env.action_manager.active_terms
@@ -109,11 +187,4 @@ def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
         cfg["observations"][obs_name] = term_cfg
 
     # --- save config file ---
-    filename = os.path.join(log_dir, "params", "deploy.yaml")
-    if not os.path.exists(os.path.dirname(filename)):
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-    if not isinstance(cfg, dict):
-        cfg = class_to_dict(cfg)
-    cfg = format_value(cfg)
-    with open(filename, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=None, sort_keys=False)
+    _write_deploy_yaml(cfg, log_dir)

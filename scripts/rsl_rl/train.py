@@ -183,6 +183,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # handle deprecated configurations for rsl-rl version compatibility
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
 
+    # RslRlVecEnvWrapper resets once in its constructor without passing a seed.
+    # Manager and Direct env construction consume random numbers in different
+    # orders, so that implicit reset can produce different initial rollout
+    # states for otherwise identical tasks.  Re-seed and reset the underlying
+    # env explicitly before the runner observes it.
+    if agent_cfg.seed is not None:
+        try:
+            env.env.reset(seed=agent_cfg.seed)
+        except TypeError:
+            env.env.reset()
+    # Environment construction/reset also consumes random numbers.  Reset the
+    # RL RNG immediately before creating the runner so policy initialization and
+    # action sampling start from the same state across workflows.
+    torch.manual_seed(agent_cfg.seed)
+
     # create runner from rsl-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     # write git state to logs

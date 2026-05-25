@@ -210,7 +210,18 @@ class ResetEventCfg:
 
 @configclass
 class StartupEventCfg:
-    """Startup events supported by PhysX only."""
+    """Startup events for both PhysX and Newton backends.
+
+    ``mdp.randomize_rigid_body_material`` auto-dispatches by the active
+    ``physics_manager`` (see ``isaaclab.envs.mdp.events.randomize_rigid_body_material``,
+    events.py:335-415):
+
+    * **PhysX**: 3-tuple (static_friction, dynamic_friction, restitution) with
+      bucket-based assignment (``num_buckets`` capped at 64000 unique materials).
+    * **Newton**: continuous per-shape sampling of friction (``mu``) and
+      ``restitution``. ``dynamic_friction_range`` and ``num_buckets`` are
+      ignored (Newton uses a single friction coefficient).
+    """
 
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
@@ -233,10 +244,32 @@ class PhysxEventCfg(ResetEventCfg, StartupEventCfg):
 
 
 @configclass
+class NewtonEventCfg(ResetEventCfg, StartupEventCfg):
+    """Newton event configuration (reset + startup).
+
+    Same as :class:`PhysxEventCfg` but ``physics_material`` is overridden
+    to use :func:`mdp.newton_randomize_rigid_body_material` (Newton uses a
+    single ``mu``; ``dynamic_friction_range`` / ``num_buckets`` are ignored).
+    Go2 uses ``mu (0.3, 1.2)`` / ``restitution (0.0, 0.15)`` matching the
+    PhysX-side cfg.
+    """
+
+    physics_material = EventTerm(
+        func=mdp.newton_randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.3, 1.2),
+            "restitution_range": (0.0, 0.15),
+        },
+    )
+
+
+@configclass
 class EventCfgPreset(PresetCfg):
     default: PhysxEventCfg = PhysxEventCfg()
     physx: PhysxEventCfg = PhysxEventCfg()
-    newton: ResetEventCfg = ResetEventCfg()
+    newton: NewtonEventCfg = NewtonEventCfg()
 
 
 @configclass

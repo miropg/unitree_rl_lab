@@ -21,3 +21,14 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Unitree-H1-Velocity-Flat-Direct",
+    entry_point="unitree_rl_lab.tasks.locomotion.direct:UnitreeVelocityDirectEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_direct_env_cfg:H1VelocityDirectEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_direct_env_cfg:H1VelocityDirectPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerCfg",
+    },
+)
