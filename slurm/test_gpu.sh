@@ -9,9 +9,9 @@
 echo "Job started on $(hostname)"
 echo "Checking GPU..."
 
-singularity exec /projects/cdux/mirop/isaac-lab.sif nvidia-smi
+singularity exec --nv /projects/cdux/mirop/isaac-lab.sif nvidia-smi
 
 echo "Checking Python..."
-singularity exec /projects/cdux/mirop/isaac-lab.sif /isaac-sim/kit/python/bin/python3.12 --version
+singularity exec --nv /projects/cdux/mirop/isaac-lab.sif /isaac-sim/kit/python/bin/python3.12 --version
 
 echo "Done!"
