@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=test_gpu
-#SBATCH --partition=cdux
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:10:00
 #SBATCH --mem=16G
