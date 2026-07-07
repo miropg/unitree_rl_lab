@@ -1,8 +1,8 @@
-#!/bin/bash
+X#!/bin/bash
 #SBATCH --job-name=train_go2
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mem=32G
 #SBATCH --output=/projects/cdux/mirop/logs/train_go2_%j.log
 

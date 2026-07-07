@@ -18,7 +18,7 @@ from isaaclab.utils import configclass
 from unitree_rl_lab.assets.robots import unitree_actuators
 
 UNITREE_MODEL_DIR = os.environ.get(
-    "UNITREE_MODEL_DIR", "/home/sharron/workspace/views2/unitree/unitree_model"
+    "UNITREE_MODEL_DIR", "/projects/cdux/mirop/unitree_model"
 )
 UNITREE_ROS_DIR = os.environ.get(
     "UNITREE_ROS_DIR", "/home/sharron/workspace/views2/unitree/unitree_ros"
