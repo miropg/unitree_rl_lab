@@ -1,4 +1,4 @@
-X#!/bin/bash
+#!/bin/bash
 #SBATCH --job-name=train_go2
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -11,6 +11,18 @@ echo "Starting Go2 training..."
 
 cd /projects/cdux/mirop/unitree_rl_lab
 
-singularity exec --nv /projects/cdux/mirop/isaac-lab.sif /isaac-sim/python.sh scripts/rsl_rl/train.py --headless --task Unitree-Go2-Velocity
+RUN_DIR=$(ls -td logs/rsl_rl/unitree_go2_velocity/*/ 2>/dev/null | head -1 | xargs basename)
+CKPT=$(ls -t logs/rsl_rl/unitree_go2_velocity/$RUN_DIR/model_*.pt 2>/dev/null | head -1 | xargs basename)
+
+if [ -n "$CKPT" ]; then
+    echo "Resuming from $RUN_DIR / $CKPT"
+    singularity exec --nv /projects/cdux/mirop/isaac-lab.sif /isaac-sim/python.sh scripts/rsl_rl/train.py \
+        --headless --task Unitree-Go2-Velocity \
+        --resume --load_run "$RUN_DIR" --checkpoint "$CKPT"
+else
+    echo "No checkpoint found, starting fresh"
+    singularity exec --nv /projects/cdux/mirop/isaac-lab.sif /isaac-sim/python.sh scripts/rsl_rl/train.py \
+        --headless --task Unitree-Go2-Velocity
+fi
 
 echo "Training done!"
