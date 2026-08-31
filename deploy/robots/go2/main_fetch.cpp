@@ -18,7 +18,7 @@
 const int ARUCO_DICT_TYPE = cv::aruco::DICT_4X4_50;
 const int VEST_MARKER_ID = 0;
 
-// CONFIRMATION CAMERA FRAME PARAMETERS                    * POSSIBLE ERRORS *
+// CONFIRMATION CAMERA FRAME PARAMETERS                    * POSSIBLE ERRORS * - some too strict?
 const int STARTUP_CONFIRM_FRAMES = 5;
 const int LOST_BALL_CONFIRM_FRAMES = 5;
 const int APPROACH_CLOSE_CONFIRM_FRAMES = 3;
@@ -48,64 +48,89 @@ std::shared_ptr<Keyboard> FSMState::keyboard = nullptr;
 const float MAX_FORWARD_SPEED = 0.4f;       // First Approach to Ball Speed
 const float TURN_GAIN = 1.0f;               // TURN LEFT & RIGHT (-1 -> 1) while first approaching ball
 const float TURN_SIGN = -1.0f;
+const float BALL_TURN_GAIN = 3.0f;          // Used in ALIGN / FINE ALIGN: centering ball while close to the ball
 const float SEARCH_SPIN_RATE = 0.0f;        // If ball is not in frame, do not spin searching for it (ethernet cord safety)
 
-const double BALL_CLOSE_AREA_PX = 180000.0;
-const double DECEL_START_AREA_PX = BALL_CLOSE_AREA_PX * 0.4; // start slowing down well before the close threshold
-const float MIN_APPROACH_SPEED = 0.12f; // don't fully stop while still approaching, just slow down
-const double COARSE_TOLERANCE_PX = 120.0;
-const double FINE_TOLERANCE_PX = 30.0;
-const float FINE_ALIGN_CREEP_SPEED = 0.08f;
-const float BALL_TURN_GAIN = 3.0f;
-const float CIRCLE_STRAFE_SPEED = 0.208f;
-const float STRAFE_SIGN = 1.0f;
-const float STRAFE_GAIN = 0.008f;
+const double BALL_CLOSE_AREA_PX = 180000.0;                  // go2 needs to be this close before switching to align
+const double DECEL_START_AREA_PX = BALL_CLOSE_AREA_PX * 0.4; // start slowing down well before reaching the ball
+const float MIN_APPROACH_SPEED = 0.12f;                      // don't fully stop while still approaching, just slow down
 
+const double COARSE_TOLERANCE_PX = 120.0;   // Used in ALIGN: 120 pixel pillow room for if ball and marker are centered
+const double FINE_TOLERANCE_PX = 30.0;      // Used in FINE ALIGN: 30 pixels of tolerance, 15 on either side of halved camera line
+const float FINE_ALIGN_CREEP_SPEED = 0.08f; // Used in FINE ALIGN: inch forward to make alignment easier
+
+// STRAFING AROUND BALL
+const float CIRCLE_STRAFE_SPEED = 0.208f;   // Circle around the ball speed
+const float STRAFE_SIGN = 1.0f;             // USED in ALIGN: speed moving left to right without turning
+const float STRAFE_GAIN = 0.008f;           // Once person + marker is visible, scalar for how strong robot corrects its strafe
+
+// CAMERA DIMENSIONS + CUT IN HALF LINE
 const int CAM_WIDTH = 1920;
 const int CAM_HEIGHT = 1080;
 const int CENTER_X = CAM_WIDTH / 2;
 
-const double VISION_HZ = 2.0;
-const double ALIGN_VISION_HZ = 6.0;
+// CHECKING CAMERA FRAMES
+const double VISION_HZ = 2.0;       // Used in SEARCH, APPROACH_BALL, WALK_THROUGH, FINAL PUSH: Checks camera 2 times /sec
+const double ALIGN_VISION_HZ = 6.0; // Used in ALIGN / FINE ALIGN:                              Checks camera 6 times /sec
 
+// SHARED RESULT STRUCT: used by both find_ball and find_vest to report
+// whether something was detected, its center position, and its area
+struct BlobResult {
+    bool found = false;
+    double cx = 0, cy = 0, area = 0;
+};
+
+// TRACKS N-CONSECUTIVE-FRAMES-TRUE FOR DEBOUNCING PHASE TRANSITIONS
+struct FrameConfirm {
+    int count = 0;
+    bool confirm(bool condition, int required_frames) {
+        count = condition ? count + 1 : 0;
+        return count >= required_frames;
+    }
+};
+
+// FINDS MARKER IN CAMERA FRAME, OUTPUTS POSITION / SIZE
+// USED in ALIGN, FINE_ALIGN, WALK_THROUGH
+// Also called in SEARCH, APPROACH_BALL as well (for the shortcut specifically, wasted work during final deployment)
 BlobResult find_vest(const cv::Mat& frame, cv::aruco::ArucoDetector& detector)
-{
-    BlobResult result;
-    std::vector<int> ids;
-    std::vector<std::vector<cv::Point2f>> corners;
+{                                                                                       // OUTPUTS POSITION / SIZE
+    BlobResult result;                                  // Emtpy container for "result", (found, cx, cy, area)
+    std::vector<int> ids;                               // Contrainer holding all ids in frame
+    std::vector<std::vector<cv::Point2f>> corners;      // Container holding dim of all markers
 
-    detector.detectMarkers(frame, corners, ids);
+    detector.detectMarkers(frame, corners, ids);        // OpenCV ArUco detection call, scans frame, finds markers
 
-    for (size_t i = 0; i < ids.size(); ++i) {
+    for (size_t i = 0; i < ids.size(); ++i) {           // loops through every marker found, should just find VEST_MARKER_ID = 0
         if (ids[i] != VEST_MARKER_ID) continue;
 
-        cv::Point2f center(0, 0);
+        cv::Point2f center(0, 0);                       // find center point of marker
         for (const auto& pt : corners[i]) center += pt;
         center *= 0.25f;
 
-        cv::Rect box = cv::boundingRect(corners[i]);
-        result.found = true;
-        result.cx = center.x;
+        cv::Rect box = cv::boundingRect(corners[i]);    // dim. of rectangle that contains all 4 corners of marker
+        result.found = true;                            // whether the marker is found
+        result.cx = center.x;                           // center of marker coordinates
         result.cy = center.y;
-        result.area = (double)box.width * box.height;
+        result.area = (double)box.width * box.height;   // area (width x height) of marker, larger area = marker is closer, etc.
         break;
     }
 
-    return result;
+    return result;                                      // OUTPUTS POSITION / SIZE of MARKER
 }
 
-const int YOLO_INPUT_SIZE = 640;
-const float BALL_CONF_THRESHOLD = 0.2f;
-const int SPORTS_BALL_CLASS_ID = 32;
-const std::string YOLO_MODEL_PATH = "/home/miro/unitree_rl_lab/deploy/robots/go2/yolov8s.onnx";
+// NEURAL NETWORK FOR BALL DETECTION                    * POSSIBLE ERRORS * - Make custom model trained on specific BALL
+const int YOLO_INPUT_SIZE = 640;        // 640 x 640 pixels, resized later to actual camera frame: 1920 x 1080
+const float BALL_CONF_THRESHOLD = 0.2f; // The model must be 20% sure or more whether the ball is in frame
+const int SPORTS_BALL_CLASS_ID = 32;    // #32 = Sports Ball
+const std::string YOLO_MODEL_PATH = "/home/miro/unitree_rl_lab/deploy/robots/go2/yolov8s.onnx"; // path to model weights file
 
+
+// YOLO CAMERA FRAMES DETECTION                         * POSSIBLE ERRORS * - Make custom model trained on specific BALL
 BlobResult find_ball(cv::dnn::Net& net, const cv::Mat& frame)
 {
-    BlobResult result;
+    BlobResult result;      // empty container for output
 
-    // Letterbox: resize preserving aspect ratio, pad remainder with gray (114,114,114),
-    // matching Ultralytics' own preprocessing. A naive stretch-resize distorts round
-    // objects into ovals and hurts detection, especially for smaller/distant objects.
+    // RESIZING FRAME FOR YOLO BALL DETECTION
     float r = std::min((float)YOLO_INPUT_SIZE / frame.cols, (float)YOLO_INPUT_SIZE / frame.rows);
     int new_w = (int)std::round(frame.cols * r);
     int new_h = (int)std::round(frame.rows * r);
@@ -132,6 +157,7 @@ BlobResult find_ball(cv::dnn::Net& net, const cv::Mat& frame)
     std::vector<float> confidences;
     float max_conf_seen = 0.0f;
 
+    // for YOLO, loops through all detections and keeps only ones that look like SPORTS BALL
     for (int i = 0; i < output_reshaped.cols; ++i) {
         float conf = output_reshaped.at<float>(4 + SPORTS_BALL_CLASS_ID, i);
         if (conf > max_conf_seen) max_conf_seen = conf;
@@ -151,26 +177,32 @@ BlobResult find_ball(cv::dnn::Net& net, const cv::Mat& frame)
         confidences.push_back(conf);
     }
 
+    // if YOLO can't detect any SPORT BALLS in frame
     if (boxes.empty()) {
         std::cout << "[ball-debug] no candidate boxes above conf=" << BALL_CONF_THRESHOLD
                    << " (max confidence seen this frame: " << max_conf_seen << ")\n";
         return result;
     }
 
+    // Handle overlapping boxes around the same ball
     std::vector<int> nms_indices;
-    cv::dnn::NMSBoxes(boxes, confidences, BALL_CONF_THRESHOLD, 0.45f, nms_indices);
+    cv::dnn::NMSBoxes(boxes, confidences, BALL_CONF_THRESHOLD, 0.45f, nms_indices); // if two detections for same ball overlap, combine
     if (nms_indices.empty()) {
         std::cout << "[ball-debug] " << boxes.size() << " candidate(s) found but NMS eliminated all\n";
         return result;
     }
+
+    // DEBUG PRINT STATEMENT: confirming how many SPORTS BALL CANDIDATES survived
     std::cout << "[ball-debug] " << boxes.size() << " candidate(s), " << nms_indices.size() << " survived NMS\n";
 
+    // Picks highest conf. box that was capturing the ball to stick with
     int best_idx = nms_indices[0];
     float best_conf = confidences[best_idx];
     for (int idx : nms_indices) {
         if (confidences[idx] > best_conf) { best_conf = confidences[idx]; best_idx = idx; }
     }
 
+    // Takes the winning ball detection frame and converts to format the rest of the code can work with
     cv::Rect best_box = boxes[best_idx];
     result.found = true;
     result.cx = best_box.x + best_box.width / 2.0;
@@ -179,6 +211,7 @@ BlobResult find_ball(cv::dnn::Net& net, const cv::Mat& frame)
     return result;
 }
 
+// SAFETY CHECK TO MAKE SURE NOTHING ELSE IS TRYING TO CONTROL THE ROBOT
 void init_fsm_state()
 {
     auto lowcmd_sub = std::make_shared<unitree::robot::go2::subscription::LowCmd>();
@@ -195,6 +228,9 @@ void init_fsm_state()
     spdlog::info("Connected to robot.");
 }
 
+
+
+// MAIN______________________________________________________________________________________
 int main(int argc, char** argv)
 {
     auto vm = param::helper(argc, argv);
@@ -306,6 +342,7 @@ int main(int argc, char** argv)
 
         if (phase == Phase::SEARCH || phase == Phase::APPROACH_BALL) {
             if (!ball.found) {
+                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
                 approach_close_confirm.confirm(false, APPROACH_CLOSE_CONFIRM_FRAMES);
                 if (lost_ball_search_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
                     phase = Phase::SEARCH;
@@ -333,6 +370,7 @@ int main(int argc, char** argv)
         }
         else if (phase == Phase::ALIGN) {
             if (!ball.found) {
+                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
                 if (lost_ball_align_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
                     phase = Phase::SEARCH;
                     target_wz = SEARCH_SPIN_RATE;
@@ -342,6 +380,8 @@ int main(int argc, char** argv)
                 double ball_offset = (ball.cx - CENTER_X) / (CAM_WIDTH / 2.0);
                 target_wz = std::clamp((float)(TURN_SIGN * BALL_TURN_GAIN * ball_offset), -1.0f, 1.0f);
                 target_vx = 0.0f;
+                std::cout << "[align-rotate-debug] ball.cx=" << ball.cx << " CENTER_X=" << CENTER_X
+                            << " ball_offset=" << ball_offset << " target_wz=" << target_wz << "\n";
                 if (!person.found) {
                     target_vy = STRAFE_SIGN * CIRCLE_STRAFE_SPEED;
                     align_coarse_confirm.confirm(false, ALIGN_COARSE_CONFIRM_FRAMES);
@@ -363,6 +403,7 @@ int main(int argc, char** argv)
         }
         else if (phase == Phase::FINE_ALIGN) {
             if (!ball.found) {
+                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
                 if (lost_ball_finealign_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
                     phase = Phase::SEARCH;
                     target_wz = SEARCH_SPIN_RATE;
