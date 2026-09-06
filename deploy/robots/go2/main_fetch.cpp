@@ -35,7 +35,7 @@ const int SIDESTEP_STEPS = 5;                    // loop iterations to sidestep
 const float WALK_PAST_SPEED = 1.0f;              // forward speed while blindly passing the ball
 const int WALK_PAST_STEPS = 3;                   // iterations to walk forward past the ball
 const float TURN_AROUND_RATE = 0.8f;             // turn speed for the 180
-const int TURN_AROUND_STEPS = 6;                 // iterations to complete ~180 deg, NEEDS CALIBRATION (doubled after step 1, unclear if turn was missed or negligible)
+const int TURN_AROUND_STEPS = 7;                 // iterations to complete ~180 deg, NEEDS CALIBRATION (doubled after step 1, unclear if turn was missed or negligible)
 const float RECENTER_SIDESTEP_SPEED = 0.15f;     // sideways speed for the post-turn recenter step
 const int RECENTER_SIDESTEP_STEPS = 4;           // iterations to recenter after the 180 turn, NEEDS CALIBRATION
 
