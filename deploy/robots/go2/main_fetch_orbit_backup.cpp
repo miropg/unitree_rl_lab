@@ -20,24 +20,17 @@ const int VEST_MARKER_ID = 0;
 
 // CONFIRMATION CAMERA FRAME PARAMETERS                    * POSSIBLE ERRORS * - some too strict?
 const int LOST_BALL_CONFIRM_FRAMES = 5;
-const int APPROACH_CLOSE_CONFIRM_FRAMES = 1;
+const int APPROACH_CLOSE_CONFIRM_FRAMES = 3;
 const int ALIGN_COARSE_CONFIRM_FRAMES = 5;      // 5?
 const int FINEALIGN_CONFIRM_FRAMES = 3;
+const int WALKTHROUGH_DONE_CONFIRM_FRAMES = 2;
 
 // LAST STRETCH of FETCH PARAMETERS     
+// returned to person (marker size must = 100,000 pixels^2)
+const double WALKTHROUGH_ARRIVED_AREA_PX = 100000.0;    // 100,000 ? need to confirm right size
 // blind walking forward after marker leaves frame from being close to the person (~3.5s at 2Hz)
 const int FINAL_PUSH_STEPS = 7; 
 const float FINAL_PUSH_SPEED = 0.8f;
-
-// SIDESTEP / WALK_PAST / TURN_AROUND / SIDESTEP_RECENTER PARAMETERS (untested guesses, calibrate on hardware)
-const float SIDESTEP_SPEED = 0.4f;              // sideways speed while stepping right around the ball
-const int SIDESTEP_STEPS = 5;                    // loop iterations to sidestep
-const float WALK_PAST_SPEED = 1.0f;              // forward speed while blindly passing the ball
-const int WALK_PAST_STEPS = 3;                   // iterations to walk forward past the ball
-const float TURN_AROUND_RATE = 0.8f;             // turn speed for the 180
-const int TURN_AROUND_STEPS = 6;                 // iterations to complete ~180 deg, NEEDS CALIBRATION (doubled after step 1, unclear if turn was missed or negligible)
-const float RECENTER_SIDESTEP_SPEED = 0.15f;     // sideways speed for the post-turn recenter step
-const int RECENTER_SIDESTEP_STEPS = 4;           // iterations to recenter after the 180 turn, NEEDS CALIBRATION
 
 // LIBRARIES
 #include <chrono>
@@ -48,16 +41,16 @@ std::unique_ptr<LowCmd_t> FSMState::lowcmd = nullptr;
 std::shared_ptr<LowState_t> FSMState::lowstate = nullptr;
 std::shared_ptr<Keyboard> FSMState::keyboard = nullptr;
 
-const float MAX_FORWARD_SPEED = 1.0f;       // First Approach to Ball Speed
+const float MAX_FORWARD_SPEED = 0.4f;       // First Approach to Ball Speed
 const float TURN_GAIN = 1.0f;               // TURN LEFT & RIGHT (-1 -> 1) while first approaching ball
 const float TURN_SIGN = -1.0f;
 const float BALL_TURN_GAIN = 3.0f;          // Used in ALIGN / FINE ALIGN: centering ball while close to the ball
 const float SEARCH_SPIN_RATE = 0.0f;        // If ball is not in frame, do not spin searching for it (ethernet cord safety)
 
-// Reverted to 180,000: the YOLO-confidence-crash issue only applied to the old continuous ALIGN tracking. SIDESTEP/WALK_PAST/TURN_AROUND are blind now, so real closeness to the ball matters more than YOLO confidence at the trigger moment. NEEDS CALIBRATION.
-const double BALL_CLOSE_AREA_PX = 180000.0;                   // go2 needs to be this close before switching to align
+// 180,000 may have been too close and caused YOLO to not register ball -> Trying 65,000 for further back
+const double BALL_CLOSE_AREA_PX = 65000.0;                   // go2 needs to be this close before switching to align
 const double DECEL_START_AREA_PX = BALL_CLOSE_AREA_PX * 0.4; // start slowing down well before reaching the ball
-const float MIN_APPROACH_SPEED = 1.0f;                      // flat approach speed (no deceleration) -- equal to MAX_FORWARD_SPEED; NEEDS RECHECK if limping persists under autopilot
+const float MIN_APPROACH_SPEED = 0.20f;                      // don't fully stop while still approaching, just slow down
 
 const double COARSE_TOLERANCE_PX = 120.0;   // Used in ALIGN: 120 pixel pillow room for if ball and marker are centered
 const double FINE_TOLERANCE_PX = 30.0;      // Used in FINE ALIGN: 30 pixels of tolerance, 15 on either side of halved camera line
@@ -96,15 +89,6 @@ struct FrameConfirm {
 // FINDS MARKER IN CAMERA FRAME, OUTPUTS POSITION / SIZE
 // USED in ALIGN, FINE_ALIGN, WALK_THROUGH
 // Also called in SEARCH, APPROACH_BALL as well (for the shortcut specifically, wasted work during final deployment)
-// SETTLE / STOP-BETWEEN-PHASES: brief full stop between blind sub-phases so each maneuver has a
-// clean, distinct start instead of one command blending directly into the next.
-const float SETTLE_PAUSE_SEC = 0.5f; // NEEDS CALIBRATION
-void settle_pause()
-{
-    isaaclab::autopilot::set(0.0f, 0.0f, 0.0f);
-    std::cout << "[fetch] settling...\n";
-    std::this_thread::sleep_for(std::chrono::milliseconds((int)(SETTLE_PAUSE_SEC * 1000)));
-}
 BlobResult find_vest(const cv::Mat& frame, cv::aruco::ArucoDetector& detector)
 {                                                                                       // OUTPUTS POSITION / SIZE
     BlobResult result;                                  // Emtpy container for "result", (found, cx, cy, area)
@@ -291,7 +275,7 @@ int main(int argc, char** argv)
     cv::aruco::ArucoDetector aruco_detector(aruco_dict, aruco_params);
 
     // POSSIBLE STAGES
-    enum class Phase { SEARCH, APPROACH_BALL, SIDESTEP, WALK_PAST, TURN_AROUND, SIDESTEP_RECENTER, ALIGN, FINE_ALIGN, FINAL_PUSH, DONE };
+    enum class Phase { SEARCH, APPROACH_BALL, ALIGN, FINE_ALIGN, WALK_THROUGH, FINAL_PUSH, DONE };
     // START: Search for ball in frame
     Phase phase = Phase::SEARCH;
 
@@ -302,13 +286,12 @@ int main(int argc, char** argv)
     FrameConfirm approach_close_confirm;
     FrameConfirm align_coarse_confirm;
     FrameConfirm finealign_fine_confirm;
+    FrameConfirm walkthrough_done_confirm;
 
+    // Remembers size of marker from last frame
+    double last_person_area = 0.0;
     // Steps taken during final push of ball
     int final_push_counter = 0;
-    int sidestep_counter = 0;
-    int walk_past_counter = 0;
-    int turn_around_counter = 0;
-    int recenter_counter = 0;
 
     // 3 MOVEMENT COMMANDS: forward, sideways, & turn speed
     float target_vx = 0.0f, target_vy = 0.0f, target_wz = SEARCH_SPIN_RATE;
@@ -405,68 +388,14 @@ int main(int argc, char** argv)
                 // If robot identifies ball is large for consecutive frames, 
                 // that means we are close enough to start rotation/ALIGN
                 if (approach_close_confirm.confirm(ball.area >= BALL_CLOSE_AREA_PX, APPROACH_CLOSE_CONFIRM_FRAMES)) {
-                    phase = Phase::SIDESTEP;
-                    sidestep_counter = 0;
-                    std::cout << "[fetch] close to ball -> SIDESTEP\n";
-                    settle_pause();
+                    // Switch to ALIGN/ORBITINg
+                    phase = Phase::ALIGN;
+                    // Print message confirming switch to ALIGN
+                    std::cout << "[fetch] close to ball -> ALIGN\n";
                 }
             }
             // DEBUG print for current phase + movement commands
             std::cout << "[fetch] phase=" << (int)phase << " target=(" << target_vx << "," << target_vy << "," << target_wz << ") ball_area=" << ball.area << "\n";
-        }
-        else if (phase == Phase::SIDESTEP) {
-            target_vx = 0.0f;
-            target_vy = -STRAFE_SIGN * SIDESTEP_SPEED; // CONFIRMED on hardware: +STRAFE_SIGN went left, negated to get right
-            target_wz = 0.0f;
-            sidestep_counter++;
-            std::cout << "[fetch] SIDESTEP step " << sidestep_counter << "/" << SIDESTEP_STEPS << "\n";
-            if (sidestep_counter >= SIDESTEP_STEPS) {
-                phase = Phase::WALK_PAST;
-                walk_past_counter = 0;
-                std::cout << "[fetch] sidestep complete -> WALK_PAST\n";
-                settle_pause();
-            }
-        }
-        else if (phase == Phase::WALK_PAST) {
-            target_vx = WALK_PAST_SPEED;
-            target_vy = 0.0f;
-            target_wz = 0.0f;
-            walk_past_counter++;
-            std::cout << "[fetch] WALK_PAST step " << walk_past_counter << "/" << WALK_PAST_STEPS << "\n";
-            if (walk_past_counter >= WALK_PAST_STEPS) {
-                phase = Phase::TURN_AROUND;
-                turn_around_counter = 0;
-                std::cout << "[fetch] walk past complete -> TURN_AROUND\n";
-                settle_pause();
-            }
-        }
-        else if (phase == Phase::TURN_AROUND) {
-            target_vx = 0.0f;
-            target_vy = 0.0f;
-            target_wz = TURN_AROUND_RATE; // CONFIRM sign/direction on hardware
-            turn_around_counter++;
-            std::cout << "[fetch] TURN_AROUND step " << turn_around_counter << "/" << TURN_AROUND_STEPS << "\n";
-            if (turn_around_counter >= TURN_AROUND_STEPS) {
-                target_wz = 0.0f;
-                phase = Phase::SIDESTEP_RECENTER;
-                recenter_counter = 0;
-                std::cout << "[fetch] turn around complete -> SIDESTEP_RECENTER\n";
-                settle_pause();
-            }
-        }
-        else if (phase == Phase::SIDESTEP_RECENTER) {
-            target_vx = 0.0f;
-            // Same body-frame sign as the initial SIDESTEP. After a real ~180 turn this should
-            // cancel the step-3 world-frame offset -- CONFIRM this actually holds on hardware.
-            target_vy = -STRAFE_SIGN * RECENTER_SIDESTEP_SPEED; // same empirical fix as SIDESTEP -- CONFIRM on hardware
-            target_wz = 0.0f;
-            recenter_counter++;
-            std::cout << "[fetch] SIDESTEP_RECENTER step " << recenter_counter << "/" << RECENTER_SIDESTEP_STEPS << "\n";
-            if (recenter_counter >= RECENTER_SIDESTEP_STEPS) {
-                phase = Phase::ALIGN;
-                std::cout << "[fetch] recenter complete -> ALIGN\n";
-                settle_pause();
-            }
         }
         // Only run if currently in ALIGN phase, if ball becomes missing again go back to SEARCH
         else if (phase == Phase::ALIGN) {
@@ -491,9 +420,9 @@ int main(int argc, char** argv)
                             << " ball_offset=" << ball_offset << " target_wz=" << target_wz << "\n";
                 // If the marker is not visible this frame
                 if (!person.found) {
-                    // no-op: previously strafed at full CIRCLE_STRAFE_SPEED to search while orbiting;
-                    // not needed now that SIDESTEP_RECENTER lands the robot roughly facing the marker.
-                    target_vy = 0.0f;
+                    // strafe sideways at constantly speed to search for marker while circling the ball
+                    target_vy = STRAFE_SIGN * CIRCLE_STRAFE_SPEED;
+                    // ARE we aligned with ball and marker set to NO
                     align_coarse_confirm.confirm(false, ALIGN_COARSE_CONFIRM_FRAMES);
 
                 // if the marker IS visible in frame
@@ -579,6 +508,38 @@ int main(int argc, char** argv)
                 }
             }
         }
+        // Only run while in WALK THROUGH
+        else if (phase == Phase::WALK_THROUGH) {
+            // If ball is visible in frame
+            if (ball.found) {
+                // Turn toward the ball
+                double offset = (ball.cx - CENTER_X) / (CAM_WIDTH / 2.0);
+                target_wz = std::clamp((float)(TURN_SIGN * TURN_GAIN * offset), -1.0f, 1.0f);
+            }
+            // Walk straight forward through the ball
+            target_vx = MAX_FORWARD_SPEED; target_vy = 0.0f;
+            // print marker's current size, and last known size
+            std::cout << "[fetch] WALK_THROUGH person_area=" << person.area
+                       << " last_person_area=" << last_person_area << "\n";
+            // If marker is found, remember marker size, used later in case marker is out of frame
+            if (person.found) {
+                last_person_area = person.area;
+            }
+            // True if marker is visible and marker looks close enough to count as arrived
+            bool arrived_visible = person.found && person.area > WALKTHROUGH_ARRIVED_AREA_PX;
+            // Handles case where robot is too close to see the Marker
+            bool arrived_via_fov_loss = !person.found && last_person_area > WALKTHROUGH_ARRIVED_AREA_PX;
+            
+            // Count frame toward "Arrived" counter if either condition above is true
+            if (walkthrough_done_confirm.confirm(arrived_visible || arrived_via_fov_loss, WALKTHROUGH_DONE_CONFIRM_FRAMES)) {
+                // State change to Final Push
+                phase = Phase::FINAL_PUSH;
+                final_push_counter = 0;
+                // Debug, print which condition triggered Final Push
+                std::cout << "[fetch] close enough (visible=" << arrived_visible
+                          << " fov_loss=" << arrived_via_fov_loss << ") -> FINAL_PUSH\n";
+            }
+        }
         // Only run if in FINAL PUSH
         else if (phase == Phase::FINAL_PUSH) {
             // Run straightforward blind
@@ -598,25 +559,7 @@ int main(int argc, char** argv)
         // Debug, print current phase and all movement commands, runs every single loop iteration, regardless of phase
         std::cout << "[align-debug] phase=" << (int)phase << " vx=" << target_vx << " vy=" << target_vy << " wz=" << target_wz << "\n";
         // Send these movement commands to go2
-        // slew-rate limit: never jump commanded velocity by more than MAX_VEL_STEP
-        // per loop iteration -- an abrupt vx 1.0 -> 0 hands the policy a step
-        // discontinuity it must absorb in one control cycle.
-        {
-            static float prev_vx = 0.0f, prev_vy = 0.0f, prev_wz = 0.0f;
-            const float MAX_VEL_STEP = 0.34f;   // m/s (or rad/s) per iteration
-            auto slew = [&](float target, float prev) {
-                float d = target - prev;
-                if (d >  MAX_VEL_STEP) d =  MAX_VEL_STEP;
-                if (d < -MAX_VEL_STEP) d = -MAX_VEL_STEP;
-                return prev + d;
-            };
-            prev_vx = slew(target_vx, prev_vx);
-            prev_vy = slew(target_vy, prev_vy);
-            prev_wz = slew(target_wz, prev_wz);
-            std::cout << "[slew] cmd=(" << target_vx << "," << target_vy << "," << target_wz
-                      << ") sent=(" << prev_vx << "," << prev_vy << "," << prev_wz << ")\n";
-            isaaclab::autopilot::set(prev_vx, prev_vy, prev_wz);
-        }
+        isaaclab::autopilot::set(target_vx, target_vy, target_wz);
     }
     // End of main while loop
 

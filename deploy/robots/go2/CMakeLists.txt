@@ -27,3 +27,7 @@ add_library(${PROJECT_NAME}_lib ${ADD_SRC_LIST})
 link_libraries(${PROJECT_NAME}_lib)
 
 add_executable(go2_ctrl main.cpp)
+find_package(OpenCV REQUIRED)
+add_executable(fetch_ctrl main_fetch.cpp)
+target_link_libraries(fetch_ctrl ${OpenCV_LIBS})
+target_include_directories(fetch_ctrl PRIVATE ${OpenCV_INCLUDE_DIRS})
