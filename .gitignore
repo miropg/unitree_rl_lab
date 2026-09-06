@@ -76,3 +76,4 @@ datasets
 deploy/robots/go2/*.bak*
 deploy/robots/go2/yolov8s.onnx
 thirdparty/onnxruntime-linux-x64-1.22.0.tgz
+deploy/thirdparty/*.tgz
