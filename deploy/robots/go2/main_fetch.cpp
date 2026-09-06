@@ -133,9 +133,9 @@ BlobResult find_vest(const cv::Mat& frame, cv::aruco::ArucoDetector& detector)
 
 // NEURAL NETWORK FOR BALL DETECTION                    * POSSIBLE ERRORS * - Make custom model trained on specific BALL
 const int YOLO_INPUT_SIZE = 640;        // 640 x 640 pixels, resized later to actual camera frame: 1920 x 1080
-const float BALL_CONF_THRESHOLD = 0.2f; // The model must be 20% sure or more whether the ball is in frame
-const int SPORTS_BALL_CLASS_ID = 32;    // #32 = Sports Ball
-const std::string YOLO_MODEL_PATH = "/home/miro/unitree_rl_lab/deploy/robots/go2/yolov8s.onnx"; // path to model weights file
+const float BALL_CONF_THRESHOLD = 0.10f; // The model must be 20% sure or more whether the ball is in frame
+const int SPORTS_BALL_CLASS_ID = 0;    // #32 = Sports Ball
+const std::string YOLO_MODEL_PATH = "/home/miro/unitree_rl_lab/deploy/robots/go2/ball_yolov8n.onnx"; // path to model weights file
 
 
 // YOLO CAMERA FRAMES DETECTION                         * POSSIBLE ERRORS * - Make custom model trained on specific BALL
@@ -161,7 +161,7 @@ BlobResult find_ball(cv::dnn::Net& net, const cv::Mat& frame)
     net.setInput(blob);
     cv::Mat output = net.forward();
 
-    cv::Mat output_reshaped = output.reshape(1, 84);
+    cv::Mat output_reshaped = output.reshape(1, 5);
 
     // Undo letterbox: map box coords from padded 640x640 space back to original frame
     float inv_scale = 1.0f / r;
