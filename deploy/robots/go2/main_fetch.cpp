@@ -17,6 +17,11 @@
 //   3. TURN_DIRECTION_SIGN is a single flip point if the turn comes out backward
 //      on hardware -- see note at its declaration below. UNCONFIRMED, first
 //      hardware test of this logic should watch the printed diff shrink, not grow.
+//   4. ALIGN_HEADING (a pure-rotation align step before each translation phase) was
+//      tried, then REMOVED per explicit design decision -- it added a confusing
+//      multi-second stall on hardware. TURN_AROUND remains the only realignment step.
+//      SIDESTEP/WALK_PAST/SIDESTEP_RECENTER/FINAL_PUSH are pure open-loop translation,
+//      wz flat at 0 throughout, no heading correction at all.
 
 #include "FSM/CtrlFSM.h"
 #include "FSM/State_Passive.h"
@@ -39,25 +44,29 @@ const int ALIGN_COARSE_CONFIRM_FRAMES = 5;      // 5?
 const int FINEALIGN_CONFIRM_FRAMES = 3;
 
 // LAST STRETCH of FETCH PARAMETERS
-// blind walking forward after marker leaves frame from being close to the person (~3.5s at 2Hz)
-const int FINAL_PUSH_STEPS = 7;
-const float FINAL_PUSH_SPEED = 0.8f;
+// NEW: blind charge back along line_heading+pi after SIDESTEP_RECENTER -- no marker/ball
+// tracking anymore, just heading-locked dead reckoning. 10 steps is a first guess.
+const int FINAL_PUSH_STEPS = 10;
+const float FINAL_PUSH_SPEED = 1.0f;
 
 // SIDESTEP / WALK_PAST / TURN_AROUND / SIDESTEP_RECENTER PARAMETERS (untested guesses, calibrate on hardware)
-const float SIDESTEP_SPEED = 0.4f;              // sideways speed while stepping right around the ball
-const int SIDESTEP_STEPS = 5;                    // loop iterations to sidestep
+const float SIDESTEP_SPEED = 0.35f;             // Was 0.2 (before that 0.4). 0.4 was borderline unsafe (near
+                                                  // fall), 0.2 felt too slow/cautious -- 0.35 as a middle ground.
+                                                  // NEEDS CALIBRATION.
+const int SIDESTEP_STEPS = 8;                    // Was 4 (before that 8, 5). Doubled again -- 4 steps at 0.2
+                                                  // m/s was confirmed too short on hardware (basically one step).
+                                                  // Speed unchanged at 0.2 for the safety margin established
+                                                  // earlier. NEEDS CALIBRATION.
 const float WALK_PAST_SPEED = 1.0f;              // forward speed while blindly passing the ball
-const int WALK_PAST_STEPS = 3;                   // iterations to walk forward past the ball
+const int WALK_PAST_STEPS = 7;                   // Was 5 (before that 16, 8, 5, 3). Slight increase per
+                                                  // direct hardware feedback -- not doubled like SIDESTEP,
+                                                  // just a modest bump. NEEDS CALIBRATION.
 const float TURN_AROUND_RATE = 0.8f;             // max turn speed magnitude for the 180 (now yaw-target-driven, see Phase::TURN_AROUND)
-const float RECENTER_SIDESTEP_SPEED = 0.15f;     // sideways speed for the post-turn recenter step
-const int RECENTER_SIDESTEP_STEPS = 13;          // Was 4. Original 4 gave only ~30% of SIDESTEP's distance
-                                                  // (0.15*4=0.6 vs SIDESTEP's 0.4*5=2.0) -- confirmed on hardware
-                                                  // tonight as an undershoot, matching the original handoff's
-                                                  // suspicion. Raised to match SIDESTEP's distance at the same
-                                                  // RECENTER_SIDESTEP_SPEED (0.15*13=1.95 ~= 0.4*5=2.0).
-                                                  // NEEDS CALIBRATION -- this assumes per-iteration distance is
-                                                  // consistent between the two phases; loop-rate drift (see
-                                                  // detector-speed notes elsewhere) could still throw it off.
+const float RECENTER_SIDESTEP_SPEED = 0.35f;     // Was 0.2 (before that 0.15, 0.4). Matches SIDESTEP_SPEED's
+                                                  // new value directly.
+const int RECENTER_SIDESTEP_STEPS = 8;           // Was 4 (before that 4, 13, 21, 8). Doubled to match
+                                                  // SIDESTEP_STEPS (8) again -- still covers the same distance
+                                                  // as the initial sidestep (0.2*8=1.6 both ways). NEEDS CALIBRATION.
 
 // NEW: pause after first detecting the ball, before APPROACH_BALL starts moving,
 // so a rolling/bouncing ball has time to settle. VISION_HZ is 2.0 (defined below),
@@ -67,6 +76,12 @@ const int INITIAL_SETTLE_STEPS = 12;
 // NEW: heading-lock parameters. During SIDESTEP/WALK_PAST/SIDESTEP_RECENTER, this
 // is a proportional correction toward line_heading instead of assuming wz=0 holds
 // straight (it doesn't -- slew-limiter carryover from the previous phase bleeds in).
+// SUPERSEDED (kept declared, unused): these drove a continuous heading correction
+// DURING translation (SIDESTEP/WALK_PAST/SIDESTEP_RECENTER/FINAL_PUSH all commanding
+// vy or vx and wz at once). Replaced by Phase::ALIGN_HEADING, which corrects heading
+// as its own separate pure-rotation step before each translation begins -- per
+// explicit design decision after a hardware fall suspected to be caused by a large,
+// sudden wz correction landing mid-SIDESTEP.
 const float HEADING_HOLD_KP = 1.2f;         // rad/s per rad of heading error
 const float HEADING_HOLD_MAX_WZ = 0.5f;     // clamp on the correction itself
 
@@ -78,6 +93,9 @@ const float TURN_DONE_TOLERANCE = 0.06f;    // ~3.4 deg, counts as "arrived"
 const int TURN_AROUND_MAX_STEPS = 25;       // safety cap: if diff is growing instead of
                                              // shrinking, TURN_DIRECTION_SIGN is backward --
                                              // this stops it from spinning indefinitely.
+// SUPERSEDED (kept declared, unused): was the safety cap for Phase::ALIGN_HEADING,
+// which was removed -- see note at the Phase enum declaration.
+const int ALIGN_HEADING_MAX_STEPS = 10;
 // UNCONFIRMED ON HARDWARE: if the printed [turn-debug] diff grows instead of shrinks
 // during the first live test, flip this to -1.0f and rebuild.
 const float TURN_DIRECTION_SIGN = 1.0f;
@@ -110,7 +128,18 @@ const float BALL_TURN_GAIN = 1.0f;          // Used in ALIGN / FINE ALIGN: cente
 const float SEARCH_SPIN_RATE = 0.0f;        // If ball is not in frame, do not spin searching for it (ethernet cord safety)
 
 // Reverted to 180,000: the YOLO-confidence-crash issue only applied to the old continuous ALIGN tracking. SIDESTEP/WALK_PAST/TURN_AROUND are blind now, so real closeness to the ball matters more than YOLO confidence at the trigger moment. NEEDS CALIBRATION.
-const double BALL_CLOSE_AREA_PX = 180000.0;                   // go2 needs to be this close before switching to align
+const double BALL_CLOSE_AREA_PX = 100000.0; // Was 180000. Tonight's actual sequence right before contact was
+                                             // 42460 -> 72779 -> 147768 -> 275377(contact) -- area roughly doubles
+                                             // per 0.5s tick near the end, so 180000 wasn't crossed until the ball
+                                             // was already essentially touching the robot. 100000 sits just above
+                                             // the 72779 frame and below 147768, so it should trigger one full tick
+                                             // earlier than tonight -- more standoff, no change to approach speed.
+                                             // NEEDS CALIBRATION -- watch the printed ball_area at the actual
+                                             // trigger frame next run; if it's still touching, this needs to drop
+                                             // further, but not blindly toward 65000 (a much earlier session found
+                                             // area plateaued ~55-64k and never crossed that threshold at all --
+                                             // that was a different setup, but worth keeping in mind before going
+                                             // that low again).
 const double DECEL_START_AREA_PX = BALL_CLOSE_AREA_PX * 0.4; // start slowing down well before reaching the ball
 const float MIN_APPROACH_SPEED = 1.0f;                      // flat approach speed (no deceleration) -- equal to MAX_FORWARD_SPEED; NEEDS RECHECK if limping persists under autopilot
 
@@ -370,17 +399,22 @@ int main(int argc, char** argv)
     // POSSIBLE STAGES
     // NEW: INITIAL_SETTLE inserted between SEARCH (first detection) and APPROACH_BALL
     // (moving toward it), so a rolling/bouncing ball has time to stop first.
-    enum class Phase { SEARCH, INITIAL_SETTLE, APPROACH_BALL, SIDESTEP, WALK_PAST, TURN_AROUND, SIDESTEP_RECENTER, ALIGN, FINE_ALIGN, FINAL_PUSH, DONE };
+    // NEW: ALIGN_HEADING (a pure-rotation correction step before each translation
+    // phase) was tried and then REMOVED per explicit design decision -- it added a
+    // confusing multi-second stall (one run hit the max-step cap without closing the
+    // error) right between SIDESTEP and WALK_PAST, making the whole sequence look like
+    // nothing was moving. TURN_AROUND remains the only realignment step, since turning
+    // around is the actual task there, not a correction to something else. SIDESTEP,
+    // WALK_PAST, SIDESTEP_RECENTER, and FINAL_PUSH are all pure open-loop translation
+    // now -- wz flat at 0, no heading correction at all, trusting step-count/speed
+    // calibration plus the settle_pause/slew fix to stay reasonably straight.
+    enum class Phase { SEARCH, INITIAL_SETTLE, APPROACH_BALL, SIDESTEP, WALK_PAST, TURN_AROUND, SIDESTEP_RECENTER, FINAL_PUSH, DONE };
     // START: Search for ball in frame
     Phase phase = Phase::SEARCH;
 
     // ALL COUNTERS for counting successful frames in a row
     FrameConfirm lost_ball_search_confirm;
-    FrameConfirm lost_ball_align_confirm;
-    FrameConfirm lost_ball_finealign_confirm;
     FrameConfirm approach_close_confirm;
-    FrameConfirm align_coarse_confirm;
-    FrameConfirm finealign_fine_confirm;
 
     // Steps taken during final push of ball
     int final_push_counter = 0;
@@ -390,9 +424,8 @@ int main(int argc, char** argv)
     int recenter_counter = 0;
     int initial_settle_counter = 0; // NEW
 
-    // NEW: heading captured the moment the robot commits to SIDESTEP -- this is
-    // "the line" the whole SIDESTEP -> WALK_PAST -> TURN_AROUND -> RECENTER
-    // sequence tries to hold / return to.
+    // NEW: heading captured the moment the robot commits to SIDESTEP -- used only by
+    // TURN_AROUND now (targets line_heading + pi) since ALIGN_HEADING was removed.
     float line_heading = 0.0f;
 
     // 3 MOVEMENT COMMANDS: forward, sideways, & turn speed
@@ -402,8 +435,9 @@ int main(int argc, char** argv)
     isaaclab::autopilot::set(target_vx, target_vy, target_wz);
     // How often to check camera
     auto vision_period = std::chrono::milliseconds((int)(1000.0 / VISION_HZ));
-    // USED IN ALIGN: How often to check camera (faster than regular check)
-    auto align_period = std::chrono::milliseconds((int)(1000.0 / ALIGN_VISION_HZ));
+    // NOTE: ALIGN_VISION_HZ / align_period removed -- was only used by ALIGN/FINE_ALIGN,
+    // which no longer exist in the active flow. ALIGN_VISION_HZ constant left declared
+    // above (harmless, unused) in case this gets re-enabled later.
 
     //_______________________________________________________________________________________________
     // STARTS FETCH CODE
@@ -411,8 +445,9 @@ int main(int argc, char** argv)
     // MAIN LOOP
     while (phase != Phase::DONE)
     {
-        // picks which camera frame capturing setting to use, faster if in ALIGN
-        auto period = (phase == Phase::ALIGN || phase == Phase::FINE_ALIGN) ? align_period : vision_period;
+        // NEW: ALIGN/FINE_ALIGN removed, so the faster align_period polling rate is no
+        // longer used anywhere -- every phase now runs at the standard vision_period.
+        auto period = vision_period;
         std::this_thread::sleep_for(period);
 
         // Grabs jpeg photo from camera
@@ -519,14 +554,22 @@ int main(int argc, char** argv)
             }
             std::cout << "[fetch] phase=" << (int)phase << " target=(" << target_vx << "," << target_vy << "," << target_wz << ") ball_area=" << ball.area << "\n";
         }
+        // NEW: generic pure-rotation align step, same yaw-servo pattern as TURN_AROUND
+        // (zero vx, zero vy, only wz), reused before every translation phase so the
+        // robot aligns first, then moves -- never both at once. align_target_yaw and
+        // align_next_phase are set by whichever phase transitions into this one.
+        // REMOVED per explicit design decision: this added a confusing multi-second
+        // stall (one run hit ALIGN_HEADING_MAX_STEPS without closing the error) sitting
+        // right between SIDESTEP and WALK_PAST, making the sequence look like nothing
+        // was moving. TURN_AROUND remains the only realignment step now.
+        // REWRITTEN: pure lateral motion, wz flat at 0, no align step before or after --
+        // straight from APPROACH_BALL's line_heading capture into this.
         else if (phase == Phase::SIDESTEP) {
             target_vx = 0.0f;
             target_vy = -STRAFE_SIGN * SIDESTEP_SPEED; // CONFIRMED on hardware: +STRAFE_SIGN went left, negated to get right
-            // NEW: hold line_heading instead of assuming wz=0 holds straight
-            target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(line_heading, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
+            target_wz = 0.0f;
             sidestep_counter++;
-            std::cout << "[fetch] SIDESTEP step " << sidestep_counter << "/" << SIDESTEP_STEPS
-                      << " heading_err=" << angle_diff(line_heading, current_yaw) << "\n";
+            std::cout << "[fetch] SIDESTEP step " << sidestep_counter << "/" << SIDESTEP_STEPS << "\n";
             if (sidestep_counter >= SIDESTEP_STEPS) {
                 phase = Phase::WALK_PAST;
                 walk_past_counter = 0;
@@ -534,14 +577,13 @@ int main(int argc, char** argv)
                 settle_pause();
             }
         }
+        // REWRITTEN: pure forward motion, wz flat at 0 (see SIDESTEP note above).
         else if (phase == Phase::WALK_PAST) {
             target_vx = WALK_PAST_SPEED;
             target_vy = 0.0f;
-            // NEW: hold line_heading
-            target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(line_heading, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
+            target_wz = 0.0f;
             walk_past_counter++;
-            std::cout << "[fetch] WALK_PAST step " << walk_past_counter << "/" << WALK_PAST_STEPS
-                      << " heading_err=" << angle_diff(line_heading, current_yaw) << "\n";
+            std::cout << "[fetch] WALK_PAST step " << walk_past_counter << "/" << WALK_PAST_STEPS << "\n";
             if (walk_past_counter >= WALK_PAST_STEPS) {
                 phase = Phase::TURN_AROUND;
                 turn_around_counter = 0;
@@ -549,10 +591,11 @@ int main(int argc, char** argv)
                 settle_pause();
             }
         }
-        // REWRITTEN: was a fixed step count (6, known to undershoot to ~150deg).
-        // Now targets (line_heading + pi) directly via measured yaw and stops on
-        // arrival, with a max-iteration safety cap in case TURN_DIRECTION_SIGN
-        // is backward on hardware (diff would grow instead of shrink).
+        // Was a fixed step count (6, known to undershoot to ~150deg). Now targets
+        // (line_heading + pi) directly via measured yaw and stops on arrival, with a
+        // max-iteration safety cap in case TURN_DIRECTION_SIGN is backward on hardware
+        // (diff would grow instead of shrink). Already a pure-rotation phase -- this is
+        // the pattern ALIGN_HEADING above reuses.
         else if (phase == Phase::TURN_AROUND) {
             float target_yaw = line_heading + (float)M_PI;
             while (target_yaw > (float)M_PI) target_yaw -= 2.0f * (float)M_PI;
@@ -581,151 +624,39 @@ int main(int argc, char** argv)
             std::cout << "[fetch] TURN_AROUND step " << turn_around_counter << " target_yaw=" << target_yaw
                       << " current_yaw=" << current_yaw << " diff=" << diff << " wz=" << target_wz << "\n";
         }
+        // REWRITTEN: pure lateral motion, wz flat at 0 (see SIDESTEP note above). No
+        // longer needs its own heading-hold block -- TURN_AROUND already leaves the
+        // robot aligned to line_heading+pi, and this phase trusts that.
         else if (phase == Phase::SIDESTEP_RECENTER) {
             target_vx = 0.0f;
             // Same body-frame sign as the initial SIDESTEP. After a real ~180 turn this should
             // cancel the step-3 world-frame offset -- CONFIRM this actually holds on hardware.
             target_vy = -STRAFE_SIGN * RECENTER_SIDESTEP_SPEED; // same empirical fix as SIDESTEP -- CONFIRM on hardware
-            // NEW: hold the post-turn heading (line_heading + pi), not the original line_heading
-            {
-                float target_yaw = line_heading + (float)M_PI;
-                while (target_yaw > (float)M_PI) target_yaw -= 2.0f * (float)M_PI;
-                while (target_yaw < -(float)M_PI) target_yaw += 2.0f * (float)M_PI;
-                target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(target_yaw, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
-            }
+            target_wz = 0.0f;
             recenter_counter++;
             std::cout << "[fetch] SIDESTEP_RECENTER step " << recenter_counter << "/" << RECENTER_SIDESTEP_STEPS << "\n";
             if (recenter_counter >= RECENTER_SIDESTEP_STEPS) {
-                phase = Phase::ALIGN;
-                std::cout << "[fetch] recenter complete -> ALIGN\n";
+                phase = Phase::FINAL_PUSH;
+                final_push_counter = 0;
+                std::cout << "[fetch] recenter complete -> FINAL_PUSH\n";
                 settle_pause();
             }
         }
-        // Only run if currently in ALIGN phase, if ball becomes missing again go back to SEARCH
-        else if (phase == Phase::ALIGN) {
-            if (!ball.found) {
-                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
-                if (lost_ball_align_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
-                    phase = Phase::SEARCH;
-                    target_wz = SEARCH_SPIN_RATE;
-                }
-            // Ball IS visible in Frame
-            } else {
-                // Ball is not lost in this frame
-                lost_ball_align_confirm.confirm(false, LOST_BALL_CONFIRM_FRAMES);
-                // How off center the ball is
-                double ball_offset = (ball.cx - CENTER_X) / (CAM_WIDTH / 2.0);
-                // Turn toward ball based on the offset
-                target_wz = std::clamp((float)(TURN_SIGN * BALL_TURN_GAIN * ball_offset), -1.0f, 1.0f);
-                // No forward, only strafing/turning
-                target_vx = 0.0f;
-                // debug print, balss position, center ref., offset, turn command used
-                std::cout << "[align-rotate-debug] ball.cx=" << ball.cx << " CENTER_X=" << CENTER_X
-                            << " ball_offset=" << ball_offset << " target_wz=" << target_wz << "\n";
-                // If the marker is not visible this frame
-                if (!person.found) {
-                    // no-op: previously strafed at full CIRCLE_STRAFE_SPEED to search while orbiting;
-                    // not needed now that SIDESTEP_RECENTER lands the robot roughly facing the marker.
-                    target_vy = 0.0f;
-                    align_coarse_confirm.confirm(false, ALIGN_COARSE_CONFIRM_FRAMES);
-
-                // if the marker IS visible in frame
-                } else {
-                    // How far off center marker is
-                    double person_err = person.cx - CENTER_X;
-                    // How far off center ball is
-                    double ball_err = ball.cx - CENTER_X;
-                    // Debugging
-                    std::cout << "[fetch] ALIGN ball_err=" << ball_err << " person_err=" << person_err << "\n";
-                    // True if both ball and marker are centered
-                    bool coarse_ok = std::abs(person_err) < COARSE_TOLERANCE_PX && std::abs(ball_err) < COARSE_TOLERANCE_PX;
-                    // Count frame as roughly aligned
-                    if (align_coarse_confirm.confirm(coarse_ok, ALIGN_COARSE_CONFIRM_FRAMES)) {
-                        // Move to tighter FINE_ALIGN
-                        phase = Phase::FINE_ALIGN;
-                        // No strafing
-                        target_vy = 0.0f;
-                        // Print for mode change
-                        std::cout << "[fetch] -> FINE_ALIGN\n";
-                    // If not aligned enough yet...
-                    } else {
-                        // Sideways correction
-                        double strafe = STRAFE_SIGN * STRAFE_GAIN * person_err;
-                        // Apply sideways correction
-                        target_vy = std::clamp((float)strafe, -CIRCLE_STRAFE_SPEED, CIRCLE_STRAFE_SPEED);
-                    }
-                }
-            }
-        }
-        // If FINE ALIGN running but ball is not visible in frame
-        else if (phase == Phase::FINE_ALIGN) {
-            if (!ball.found) {
-                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
-                if (lost_ball_finealign_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
-                    phase = Phase::SEARCH;
-                    target_wz = SEARCH_SPIN_RATE;
-                }
-
-            // If ball is still visible
-            } else {
-                // is ball lost counter set to 0
-                lost_ball_finealign_confirm.confirm(false, LOST_BALL_CONFIRM_FRAMES);
-                // Readjust to center ball
-                double ball_offset = (ball.cx - CENTER_X) / (CAM_WIDTH / 2.0);
-                target_wz = std::clamp((float)(TURN_SIGN * BALL_TURN_GAIN * ball_offset), -1.0f, 1.0f);
-                // Slowly creep forward toward the ball while adjusting
-                target_vx = FINE_ALIGN_CREEP_SPEED;
-                // If marker is not visible
-                if (!person.found) {
-                    // strafe sideways
-                    target_vy = STRAFE_SIGN * CIRCLE_STRAFE_SPEED * 0.5f;
-                    // tell preciesly aligned counter currently not aligned
-                    finealign_fine_confirm.confirm(false, FINEALIGN_CONFIRM_FRAMES);
-
-                // Marker is visible in frame
-                } else {
-                    // How far off center marker is
-                    double person_err = person.cx - CENTER_X;
-                    // how far off center ball is
-                    double ball_err = ball.cx - CENTER_X;
-                    // Debug, print offsets
-                    std::cout << "[fetch] FINE_ALIGN ball_err=" << ball_err << " person_err=" << person_err << "\n";
-
-                    // True if both ball and person are aligned correctly
-                    bool fine_ok = std::abs(person_err) < FINE_TOLERANCE_PX && std::abs(ball_err) < FINE_TOLERANCE_PX;
-                    // Counter frame as percisely aligned
-                    if (finealign_fine_confirm.confirm(fine_ok, FINEALIGN_CONFIRM_FRAMES)) {
-                        // Final charge to get ball to marker
-                        phase = Phase::FINAL_PUSH;
-                        final_push_counter = 0;
-                        // no more strafing
-                        target_vy = 0.0f;
-                        // print phase change
-                        std::cout << "[fetch] precisely aligned -> FINAL_PUSH\n";
-
-                    // Ball and marker are NOT precisely aligned
-                    } else {
-                        // sideways adjustment to how far marker is + apply the adjustment with fine alignment movement speed
-                        double strafe = STRAFE_SIGN * STRAFE_GAIN * person_err;
-                        target_vy = std::clamp((float)strafe, -CIRCLE_STRAFE_SPEED * 0.5f, CIRCLE_STRAFE_SPEED * 0.5f);
-                    }
-                }
-            }
-        }
-        // Only run if in FINAL PUSH
+        // Per explicit design decision: after SIDESTEP_RECENTER, the robot should
+        // already be back on line_heading, facing line_heading+pi. This phase charges
+        // straight back along that heading, blind, for FINAL_PUSH_STEPS iterations.
+        // Pure forward motion, wz flat at 0, no align step before it -- no ball or
+        // marker detection involved.
         else if (phase == Phase::FINAL_PUSH) {
-            // Run straightforward blind
-            target_vx = FINAL_PUSH_SPEED; target_vy = 0.0f; target_wz = 0.0f;
-            // Add step to final push counter
+            target_vx = FINAL_PUSH_SPEED;
+            target_vy = 0.0f;
+            target_wz = 0.0f;
             final_push_counter++;
-            // Debug, print step counter
             std::cout << "[fetch] FINAL_PUSH step " << final_push_counter << "/" << FINAL_PUSH_STEPS << " vx=" << target_vx << "\n";
-            // If taken enough steps...
             if (final_push_counter >= FINAL_PUSH_STEPS) {
-                // Stop the Go2
                 target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
                 phase = Phase::DONE;
-                std::cout << "[fetch] final push complete -> DONE (no re-throw on hardware; stopping)\n";
+                std::cout << "[fetch] final push complete -> DONE\n";
             }
         }
         // Debug, print current phase and all movement commands, runs every single loop iteration, regardless of phase
