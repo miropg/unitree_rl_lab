@@ -4,6 +4,19 @@
 //
 // NOTE: HSV threshold values below are PLACEHOLDERS. They WILL need live
 // recalibration against real camera footage under real lighting.
+//
+// SESSION CHANGES (this pass):
+//   1. New Phase::INITIAL_SETTLE -- after first ball detection, hold position
+//      for INITIAL_SETTLE_STEPS iterations (~6s at VISION_HZ) before APPROACH_BALL
+//      starts moving, so a rolling/bouncing ball has time to stop.
+//   2. line_heading: snapshotted (from live IMU yaw) at the moment the robot
+//      commits to SIDESTEP. SIDESTEP / WALK_PAST / SIDESTEP_RECENTER now
+//      closed-loop correct target_wz to hold that heading instead of assuming
+//      wz=0 holds straight. TURN_AROUND now targets (line_heading + pi) directly
+//      via measured yaw instead of a fixed step count.
+//   3. TURN_DIRECTION_SIGN is a single flip point if the turn comes out backward
+//      on hardware -- see note at its declaration below. UNCONFIRMED, first
+//      hardware test of this logic should watch the printed diff shrink, not grow.
 
 #include "FSM/CtrlFSM.h"
 #include "FSM/State_Passive.h"
@@ -13,6 +26,7 @@
 #include <unitree/robot/go2/video/video_client.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
+#include <cmath>
 
 // BLACK & WHITE MARKER
 const int ARUCO_DICT_TYPE = cv::aruco::DICT_4X4_50;
@@ -24,9 +38,9 @@ const int APPROACH_CLOSE_CONFIRM_FRAMES = 1;
 const int ALIGN_COARSE_CONFIRM_FRAMES = 5;      // 5?
 const int FINEALIGN_CONFIRM_FRAMES = 3;
 
-// LAST STRETCH of FETCH PARAMETERS     
+// LAST STRETCH of FETCH PARAMETERS
 // blind walking forward after marker leaves frame from being close to the person (~3.5s at 2Hz)
-const int FINAL_PUSH_STEPS = 7; 
+const int FINAL_PUSH_STEPS = 7;
 const float FINAL_PUSH_SPEED = 0.8f;
 
 // SIDESTEP / WALK_PAST / TURN_AROUND / SIDESTEP_RECENTER PARAMETERS (untested guesses, calibrate on hardware)
@@ -34,10 +48,39 @@ const float SIDESTEP_SPEED = 0.4f;              // sideways speed while stepping
 const int SIDESTEP_STEPS = 5;                    // loop iterations to sidestep
 const float WALK_PAST_SPEED = 1.0f;              // forward speed while blindly passing the ball
 const int WALK_PAST_STEPS = 3;                   // iterations to walk forward past the ball
-const float TURN_AROUND_RATE = 0.8f;             // turn speed for the 180
-const int TURN_AROUND_STEPS = 7;                 // iterations to complete ~180 deg, NEEDS CALIBRATION (doubled after step 1, unclear if turn was missed or negligible)
+const float TURN_AROUND_RATE = 0.8f;             // max turn speed magnitude for the 180 (now yaw-target-driven, see Phase::TURN_AROUND)
 const float RECENTER_SIDESTEP_SPEED = 0.15f;     // sideways speed for the post-turn recenter step
-const int RECENTER_SIDESTEP_STEPS = 4;           // iterations to recenter after the 180 turn, NEEDS CALIBRATION
+const int RECENTER_SIDESTEP_STEPS = 13;          // Was 4. Original 4 gave only ~30% of SIDESTEP's distance
+                                                  // (0.15*4=0.6 vs SIDESTEP's 0.4*5=2.0) -- confirmed on hardware
+                                                  // tonight as an undershoot, matching the original handoff's
+                                                  // suspicion. Raised to match SIDESTEP's distance at the same
+                                                  // RECENTER_SIDESTEP_SPEED (0.15*13=1.95 ~= 0.4*5=2.0).
+                                                  // NEEDS CALIBRATION -- this assumes per-iteration distance is
+                                                  // consistent between the two phases; loop-rate drift (see
+                                                  // detector-speed notes elsewhere) could still throw it off.
+
+// NEW: pause after first detecting the ball, before APPROACH_BALL starts moving,
+// so a rolling/bouncing ball has time to settle. VISION_HZ is 2.0 (defined below),
+// so 12 iterations = ~6s. If VISION_HZ changes, this iteration count must be re-derived.
+const int INITIAL_SETTLE_STEPS = 12;
+
+// NEW: heading-lock parameters. During SIDESTEP/WALK_PAST/SIDESTEP_RECENTER, this
+// is a proportional correction toward line_heading instead of assuming wz=0 holds
+// straight (it doesn't -- slew-limiter carryover from the previous phase bleeds in).
+const float HEADING_HOLD_KP = 1.2f;         // rad/s per rad of heading error
+const float HEADING_HOLD_MAX_WZ = 0.5f;     // clamp on the correction itself
+
+// NEW: TURN_AROUND is now yaw-target-driven (target = line_heading + pi) rather
+// than a fixed step count, replacing the old "6 steps ~150deg, needs 7" guessing.
+const float TURN_KP = 1.5f;                 // rad/s per rad of yaw error
+const float TURN_MIN_RATE = 0.15f;          // floor so it doesn't crawl to a stop near the target
+const float TURN_DONE_TOLERANCE = 0.06f;    // ~3.4 deg, counts as "arrived"
+const int TURN_AROUND_MAX_STEPS = 25;       // safety cap: if diff is growing instead of
+                                             // shrinking, TURN_DIRECTION_SIGN is backward --
+                                             // this stops it from spinning indefinitely.
+// UNCONFIRMED ON HARDWARE: if the printed [turn-debug] diff grows instead of shrinks
+// during the first live test, flip this to -1.0f and rebuild.
+const float TURN_DIRECTION_SIGN = 1.0f;
 
 // LIBRARIES
 #include <chrono>
@@ -48,10 +91,22 @@ std::unique_ptr<LowCmd_t> FSMState::lowcmd = nullptr;
 std::shared_ptr<LowState_t> FSMState::lowstate = nullptr;
 std::shared_ptr<Keyboard> FSMState::keyboard = nullptr;
 
+// NEW: slew-limiter memory, now file-scope so settle_pause() can reset it. Previously
+// this was a `static` local inside the main loop's slew block, invisible to
+// settle_pause() -- so settle_pause()'s hard-zero command wasn't reflected here, and
+// the next phase's slew ramp incorrectly assumed continuity from the PRE-pause
+// velocity, reintroducing old momentum right when a phase transition wanted a clean
+// stop. This is what carried the robot through the ball during SIDESTEP tonight.
+float g_prev_vx = 0.0f, g_prev_vy = 0.0f, g_prev_wz = 0.0f;
+
 const float MAX_FORWARD_SPEED = 1.0f;       // First Approach to Ball Speed
 const float TURN_GAIN = 1.0f;               // TURN LEFT & RIGHT (-1 -> 1) while first approaching ball
 const float TURN_SIGN = -1.0f;
-const float BALL_TURN_GAIN = 3.0f;          // Used in ALIGN / FINE ALIGN: centering ball while close to the ball
+const float BALL_TURN_GAIN = 1.0f;          // Used in ALIGN / FINE ALIGN: centering ball while close to the ball
+                                             // NEW: lowered from 3.0 -- tonight's first-ever ALIGN run showed the ball
+                                             // offset oscillating hard between opposite frame edges rather than
+                                             // converging (classic high-gain overshoot). This is a conservative first
+                                             // guess, not a confirmed fix -- expect to retune further next run.
 const float SEARCH_SPIN_RATE = 0.0f;        // If ball is not in frame, do not spin searching for it (ethernet cord safety)
 
 // Reverted to 180,000: the YOLO-confidence-crash issue only applied to the old continuous ALIGN tracking. SIDESTEP/WALK_PAST/TURN_AROUND are blind now, so real closeness to the ball matters more than YOLO confidence at the trigger moment. NEEDS CALIBRATION.
@@ -93,6 +148,25 @@ struct FrameConfirm {
     }
 };
 
+// NEW: reads live yaw (heading) from the IMU quaternion on FSMState::lowstate.
+// Confirmed quaternion index order from unitree_articulation.h: it's passed
+// positionally into Eigen::Quaternionf(w, x, y, z), so index 0 is w.
+float get_current_yaw()
+{
+    const auto& q = FSMState::lowstate->msg_.imu_state().quaternion(); // [w, x, y, z]
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+    return std::atan2(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
+}
+
+// NEW: signed shortest-path angle difference (target - current), wrapped to [-pi, pi]
+float angle_diff(float target, float current)
+{
+    float d = target - current;
+    while (d > (float)M_PI) d -= 2.0f * (float)M_PI;
+    while (d < -(float)M_PI) d += 2.0f * (float)M_PI;
+    return d;
+}
+
 // FINDS MARKER IN CAMERA FRAME, OUTPUTS POSITION / SIZE
 // USED in ALIGN, FINE_ALIGN, WALK_THROUGH
 // Also called in SEARCH, APPROACH_BALL as well (for the shortcut specifically, wasted work during final deployment)
@@ -102,6 +176,9 @@ const float SETTLE_PAUSE_SEC = 0.5f; // NEEDS CALIBRATION
 void settle_pause()
 {
     isaaclab::autopilot::set(0.0f, 0.0f, 0.0f);
+    // NEW: the robot really is at zero now -- make the slew limiter's memory agree,
+    // so the next phase ramps from true zero instead of resuming the pre-pause velocity.
+    g_prev_vx = 0.0f; g_prev_vy = 0.0f; g_prev_wz = 0.0f;
     std::cout << "[fetch] settling...\n";
     std::this_thread::sleep_for(std::chrono::milliseconds((int)(SETTLE_PAUSE_SEC * 1000)));
 }
@@ -256,7 +333,7 @@ int main(int argc, char** argv)
     // Connects robot to computer via ethernet connection
     unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
 
-    // Sets up the different modes the robot can be in, walking, standing 
+    // Sets up the different modes the robot can be in, walking, standing
     init_fsm_state();
 
     // Create the brain that controls these modes/states & turn brain on
@@ -284,14 +361,16 @@ int main(int argc, char** argv)
     ball_net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
     ball_net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
 
-    // Loads set of known markers + default settings + creates marker detection 
+    // Loads set of known markers + default settings + creates marker detection
     // and now ready to see the marker in each frame
     cv::aruco::Dictionary aruco_dict = cv::aruco::getPredefinedDictionary(ARUCO_DICT_TYPE);
     cv::aruco::DetectorParameters aruco_params = cv::aruco::DetectorParameters();
     cv::aruco::ArucoDetector aruco_detector(aruco_dict, aruco_params);
 
     // POSSIBLE STAGES
-    enum class Phase { SEARCH, APPROACH_BALL, SIDESTEP, WALK_PAST, TURN_AROUND, SIDESTEP_RECENTER, ALIGN, FINE_ALIGN, FINAL_PUSH, DONE };
+    // NEW: INITIAL_SETTLE inserted between SEARCH (first detection) and APPROACH_BALL
+    // (moving toward it), so a rolling/bouncing ball has time to stop first.
+    enum class Phase { SEARCH, INITIAL_SETTLE, APPROACH_BALL, SIDESTEP, WALK_PAST, TURN_AROUND, SIDESTEP_RECENTER, ALIGN, FINE_ALIGN, FINAL_PUSH, DONE };
     // START: Search for ball in frame
     Phase phase = Phase::SEARCH;
 
@@ -309,6 +388,12 @@ int main(int argc, char** argv)
     int walk_past_counter = 0;
     int turn_around_counter = 0;
     int recenter_counter = 0;
+    int initial_settle_counter = 0; // NEW
+
+    // NEW: heading captured the moment the robot commits to SIDESTEP -- this is
+    // "the line" the whole SIDESTEP -> WALK_PAST -> TURN_AROUND -> RECENTER
+    // sequence tries to hold / return to.
+    float line_heading = 0.0f;
 
     // 3 MOVEMENT COMMANDS: forward, sideways, & turn speed
     float target_vx = 0.0f, target_vy = 0.0f, target_wz = SEARCH_SPIN_RATE;
@@ -349,77 +434,99 @@ int main(int argc, char** argv)
         BlobResult ball = find_ball(ball_net, frame);
         // run YOLO model on usable frame to find the marker, outputs yes/no found, and where it is
         BlobResult person = find_vest(frame, aruco_detector);
-        // Clone image for drawing on 
+        // NEW: current measured yaw, used by heading-lock phases below
+        float current_yaw = get_current_yaw();
+        // Clone image for drawing on
         cv::Mat display = frame.clone();
         // Draw cut in half camera line down the middle
         cv::line(display, cv::Point(CENTER_X, 0), cv::Point(CENTER_X, CAM_HEIGHT), cv::Scalar(0,0,0), 1);
         // if they are found, draw "GREEN +" on ball and "Orange +" on marker
         if (ball.found) cv::drawMarker(display, cv::Point((int)ball.cx, (int)ball.cy), cv::Scalar(0,255,0), cv::MARKER_CROSS, 20, 2);
         if (person.found) cv::drawMarker(display, cv::Point((int)person.cx, (int)person.cy), cv::Scalar(0,140,255), cv::MARKER_CROSS, 20, 2);
-        
+
         // Show image, with the "+" on it & cut in half screen
         cv::imshow("Go2 Fetch - live view", display);
         cv::waitKey(1);
 
         // MAIN LOGIC OF FETCH_______________________________________________________________________________
 
-        // Only run if SEARCHING for ball or APPROACHING ball
-        if (phase == Phase::SEARCH || phase == Phase::APPROACH_BALL) {
-            
-            // IF BALL IS NOT VISIBLE IN FRAME
+        if (phase == Phase::SEARCH) {
             if (!ball.found) {
                 // Don't move
                 target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
-
-                // Tell the counter that determines if the robot is close enough to the ball to switch
-                // to ALIGN that we aren't close enough
                 approach_close_confirm.confirm(false, APPROACH_CLOSE_CONFIRM_FRAMES);
-                // Tell the counter that determines if the ball is lost that is is indeed lost
                 if (lost_ball_search_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
-                    // STAY IN SEARCH
                     phase = Phase::SEARCH;
-                    // make sure spinrate is still 0 (don't want robot spinning around to look for ball, safety)
                     target_wz = SEARCH_SPIN_RATE;
                 }
-            // IF BALL IS VISIBLE IN FRAME
             } else {
-                // Tell "is ball lost counter" this frame does not count as lost
+                // NEW: ball just appeared -- don't charge yet, go settle first.
                 lost_ball_search_confirm.confirm(false, LOST_BALL_CONFIRM_FRAMES);
-                // START Approaching ball
-                phase = Phase::APPROACH_BALL;
-                // Notice how much ball is off from the center, and then adjust to approach it accordingly
+                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
+                phase = Phase::INITIAL_SETTLE;
+                initial_settle_counter = 0;
+                std::cout << "[fetch] ball detected -> INITIAL_SETTLE\n";
+            }
+            std::cout << "[fetch] phase=" << (int)phase << " target=(" << target_vx << "," << target_vy << "," << target_wz << ") ball_area=" << ball.area << "\n";
+        }
+        // NEW PHASE: hold still for INITIAL_SETTLE_STEPS iterations so a
+        // rolling/bouncing ball has time to stop before the robot commits to it.
+        else if (phase == Phase::INITIAL_SETTLE) {
+            target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
+            if (!ball.found) {
+                // Ball rolled out of frame during settle -- don't guess, go back to searching.
+                std::cout << "[fetch] ball lost during INITIAL_SETTLE -> SEARCH\n";
+                phase = Phase::SEARCH;
+                initial_settle_counter = 0;
+            } else {
+                initial_settle_counter++;
+                std::cout << "[fetch] INITIAL_SETTLE step " << initial_settle_counter << "/" << INITIAL_SETTLE_STEPS << "\n";
+                if (initial_settle_counter >= INITIAL_SETTLE_STEPS) {
+                    phase = Phase::APPROACH_BALL;
+                    std::cout << "[fetch] settle complete -> APPROACH_BALL\n";
+                }
+            }
+        }
+        else if (phase == Phase::APPROACH_BALL) {
+            if (!ball.found) {
+                target_vx = 0.0f; target_vy = 0.0f; target_wz = 0.0f;
+                approach_close_confirm.confirm(false, APPROACH_CLOSE_CONFIRM_FRAMES);
+                if (lost_ball_search_confirm.confirm(true, LOST_BALL_CONFIRM_FRAMES)) {
+                    phase = Phase::SEARCH;
+                    target_wz = SEARCH_SPIN_RATE;
+                }
+            } else {
+                lost_ball_search_confirm.confirm(false, LOST_BALL_CONFIRM_FRAMES);
                 double offset = (ball.cx - CENTER_X) / (CAM_WIDTH / 2.0);
                 target_wz = std::clamp((float)(TURN_SIGN * TURN_GAIN * offset), -1.0f, 1.0f);
-                // If ball looks small from far away
                 if (ball.area < DECEL_START_AREA_PX) {
-                    // Walk forward at full speed
                     target_vx = MAX_FORWARD_SPEED;
-                // Else walk to the ball as if we are already close to it, AKA start walking slower
                 } else {
                     double t = (ball.area - DECEL_START_AREA_PX) / (BALL_CLOSE_AREA_PX - DECEL_START_AREA_PX);
                     t = std::clamp(t, 0.0, 1.0);
                     target_vx = MAX_FORWARD_SPEED - (float)t * (MAX_FORWARD_SPEED - MIN_APPROACH_SPEED);
                 }
-                // No sideways movement while approaching, only forward and turning
                 target_vy = 0.0f;
-                // If robot identifies ball is large for consecutive frames, 
-                // that means we are close enough to start rotation/ALIGN
                 if (approach_close_confirm.confirm(ball.area >= BALL_CLOSE_AREA_PX, APPROACH_CLOSE_CONFIRM_FRAMES)) {
+                    // NEW: snapshot the line here -- this is the last moment heading
+                    // is deliberately chosen before the blind maneuver sequence.
+                    line_heading = current_yaw;
                     phase = Phase::SIDESTEP;
                     sidestep_counter = 0;
-                    std::cout << "[fetch] close to ball -> SIDESTEP\n";
+                    std::cout << "[fetch] close to ball -> SIDESTEP (line_heading=" << line_heading << ")\n";
                     settle_pause();
                 }
             }
-            // DEBUG print for current phase + movement commands
             std::cout << "[fetch] phase=" << (int)phase << " target=(" << target_vx << "," << target_vy << "," << target_wz << ") ball_area=" << ball.area << "\n";
         }
         else if (phase == Phase::SIDESTEP) {
             target_vx = 0.0f;
             target_vy = -STRAFE_SIGN * SIDESTEP_SPEED; // CONFIRMED on hardware: +STRAFE_SIGN went left, negated to get right
-            target_wz = 0.0f;
+            // NEW: hold line_heading instead of assuming wz=0 holds straight
+            target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(line_heading, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
             sidestep_counter++;
-            std::cout << "[fetch] SIDESTEP step " << sidestep_counter << "/" << SIDESTEP_STEPS << "\n";
+            std::cout << "[fetch] SIDESTEP step " << sidestep_counter << "/" << SIDESTEP_STEPS
+                      << " heading_err=" << angle_diff(line_heading, current_yaw) << "\n";
             if (sidestep_counter >= SIDESTEP_STEPS) {
                 phase = Phase::WALK_PAST;
                 walk_past_counter = 0;
@@ -430,9 +537,11 @@ int main(int argc, char** argv)
         else if (phase == Phase::WALK_PAST) {
             target_vx = WALK_PAST_SPEED;
             target_vy = 0.0f;
-            target_wz = 0.0f;
+            // NEW: hold line_heading
+            target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(line_heading, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
             walk_past_counter++;
-            std::cout << "[fetch] WALK_PAST step " << walk_past_counter << "/" << WALK_PAST_STEPS << "\n";
+            std::cout << "[fetch] WALK_PAST step " << walk_past_counter << "/" << WALK_PAST_STEPS
+                      << " heading_err=" << angle_diff(line_heading, current_yaw) << "\n";
             if (walk_past_counter >= WALK_PAST_STEPS) {
                 phase = Phase::TURN_AROUND;
                 turn_around_counter = 0;
@@ -440,26 +549,50 @@ int main(int argc, char** argv)
                 settle_pause();
             }
         }
+        // REWRITTEN: was a fixed step count (6, known to undershoot to ~150deg).
+        // Now targets (line_heading + pi) directly via measured yaw and stops on
+        // arrival, with a max-iteration safety cap in case TURN_DIRECTION_SIGN
+        // is backward on hardware (diff would grow instead of shrink).
         else if (phase == Phase::TURN_AROUND) {
+            float target_yaw = line_heading + (float)M_PI;
+            while (target_yaw > (float)M_PI) target_yaw -= 2.0f * (float)M_PI;
+            while (target_yaw < -(float)M_PI) target_yaw += 2.0f * (float)M_PI;
+            float diff = angle_diff(target_yaw, current_yaw);
+            turn_around_counter++;
+
             target_vx = 0.0f;
             target_vy = 0.0f;
-            target_wz = TURN_AROUND_RATE; // CONFIRM sign/direction on hardware
-            turn_around_counter++;
-            std::cout << "[fetch] TURN_AROUND step " << turn_around_counter << "/" << TURN_AROUND_STEPS << "\n";
-            if (turn_around_counter >= TURN_AROUND_STEPS) {
+
+            if (std::abs(diff) < TURN_DONE_TOLERANCE || turn_around_counter >= TURN_AROUND_MAX_STEPS) {
                 target_wz = 0.0f;
                 phase = Phase::SIDESTEP_RECENTER;
                 recenter_counter = 0;
-                std::cout << "[fetch] turn around complete -> SIDESTEP_RECENTER\n";
+                std::cout << "[fetch] turn around complete (diff=" << diff
+                          << ", steps=" << turn_around_counter << ") -> SIDESTEP_RECENTER\n";
+                if (turn_around_counter >= TURN_AROUND_MAX_STEPS && std::abs(diff) >= TURN_DONE_TOLERANCE) {
+                    std::cout << "[fetch] WARNING: TURN_AROUND hit max step cap without closing diff -- "
+                                 "check TURN_DIRECTION_SIGN, it may be backward\n";
+                }
                 settle_pause();
+            } else {
+                float mag = std::clamp(std::abs(diff) * TURN_KP, TURN_MIN_RATE, TURN_AROUND_RATE);
+                target_wz = TURN_DIRECTION_SIGN * (diff > 0 ? 1.0f : -1.0f) * mag;
             }
+            std::cout << "[fetch] TURN_AROUND step " << turn_around_counter << " target_yaw=" << target_yaw
+                      << " current_yaw=" << current_yaw << " diff=" << diff << " wz=" << target_wz << "\n";
         }
         else if (phase == Phase::SIDESTEP_RECENTER) {
             target_vx = 0.0f;
             // Same body-frame sign as the initial SIDESTEP. After a real ~180 turn this should
             // cancel the step-3 world-frame offset -- CONFIRM this actually holds on hardware.
             target_vy = -STRAFE_SIGN * RECENTER_SIDESTEP_SPEED; // same empirical fix as SIDESTEP -- CONFIRM on hardware
-            target_wz = 0.0f;
+            // NEW: hold the post-turn heading (line_heading + pi), not the original line_heading
+            {
+                float target_yaw = line_heading + (float)M_PI;
+                while (target_yaw > (float)M_PI) target_yaw -= 2.0f * (float)M_PI;
+                while (target_yaw < -(float)M_PI) target_yaw += 2.0f * (float)M_PI;
+                target_wz = std::clamp(HEADING_HOLD_KP * angle_diff(target_yaw, current_yaw), -HEADING_HOLD_MAX_WZ, HEADING_HOLD_MAX_WZ);
+            }
             recenter_counter++;
             std::cout << "[fetch] SIDESTEP_RECENTER step " << recenter_counter << "/" << RECENTER_SIDESTEP_STEPS << "\n";
             if (recenter_counter >= RECENTER_SIDESTEP_STEPS) {
@@ -602,7 +735,8 @@ int main(int argc, char** argv)
         // per loop iteration -- an abrupt vx 1.0 -> 0 hands the policy a step
         // discontinuity it must absorb in one control cycle.
         {
-            static float prev_vx = 0.0f, prev_vy = 0.0f, prev_wz = 0.0f;
+            // NEW: uses g_prev_vx/vy/wz (file scope) instead of local statics, so
+            // settle_pause() can reset them to a true zero baseline between phases.
             const float MAX_VEL_STEP = 0.34f;   // m/s (or rad/s) per iteration
             auto slew = [&](float target, float prev) {
                 float d = target - prev;
@@ -610,12 +744,12 @@ int main(int argc, char** argv)
                 if (d < -MAX_VEL_STEP) d = -MAX_VEL_STEP;
                 return prev + d;
             };
-            prev_vx = slew(target_vx, prev_vx);
-            prev_vy = slew(target_vy, prev_vy);
-            prev_wz = slew(target_wz, prev_wz);
+            g_prev_vx = slew(target_vx, g_prev_vx);
+            g_prev_vy = slew(target_vy, g_prev_vy);
+            g_prev_wz = slew(target_wz, g_prev_wz);
             std::cout << "[slew] cmd=(" << target_vx << "," << target_vy << "," << target_wz
-                      << ") sent=(" << prev_vx << "," << prev_vy << "," << prev_wz << ")\n";
-            isaaclab::autopilot::set(prev_vx, prev_vy, prev_wz);
+                      << ") sent=(" << g_prev_vx << "," << g_prev_vy << "," << g_prev_wz << ")\n";
+            isaaclab::autopilot::set(g_prev_vx, g_prev_vy, g_prev_wz);
         }
     }
     // End of main while loop
